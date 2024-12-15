@@ -11,14 +11,16 @@ import (
 func RunPipeline(cmds ...cmd) {
 	in := make(chan interface{})
 	wg := &sync.WaitGroup{}
+	commandRunner := func(in, out chan interface{}, commandIdx int, group *sync.WaitGroup) {
+		defer group.Done()
+		defer close(out)
+		cmds[commandIdx](in, out)
+	}
+
 	for cmdIdx := range cmds {
 		wg.Add(1)
 		out := make(chan interface{})
-		go func(group *sync.WaitGroup, commandIdx int, in, out chan interface{}) {
-			defer group.Done()
-			defer close(out)
-			cmds[commandIdx](in, out)
-		}(wg, cmdIdx, in, out)
+		go commandRunner(in, out, cmdIdx, wg)
 		in = out
 	}
 	wg.Wait()
@@ -28,23 +30,32 @@ func SelectUsers(in, out chan interface{}) {
 	wg := &sync.WaitGroup{}
 	mu := &sync.Mutex{}
 	uniqueUsers := make(map[string]struct{}, 10)
+	getUserByEmail := func(email interface{}) (User, error) {
+		emailString, ok := email.(string)
+		if !ok {
+			return User{}, fmt.Errorf("SelectUsers: failed to convert to type %T", "")
+		}
+		return GetUser(emailString), nil
+
+	}
+	passUniqueUsers := func(email interface{}, group *sync.WaitGroup) {
+		defer group.Done()
+		user, err := getUserByEmail(email)
+		if err != nil {
+			log.Println(err)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if _, isAlias := uniqueUsers[user.Email]; !isAlias {
+			uniqueUsers[user.Email] = struct{}{}
+			out <- user
+		}
+	}
+
 	for email := range in {
 		wg.Add(1)
-		go func(group *sync.WaitGroup, email interface{}) {
-			defer group.Done()
-			emailString, ok := email.(string)
-			if !ok {
-				log.Printf("SelectUsers: failed to convert to type: %T", "")
-				return
-			}
-			user := GetUser(emailString)
-			mu.Lock()
-			if _, isAlias := uniqueUsers[user.Email]; !isAlias {
-				uniqueUsers[user.Email] = struct{}{}
-				out <- user
-			}
-			mu.Unlock()
-		}(wg, email)
+		go passUniqueUsers(email, wg)
 	}
 	wg.Wait()
 }
@@ -55,7 +66,7 @@ func SelectMessages(in, out chan interface{}) {
 	for user := range in {
 		userStruct, ok := user.(User)
 		if !ok {
-			log.Printf("SelectMessages: failed to convert to type: %T", User{})
+			log.Printf("SelectMessages: failed to convert to type: %T\n", User{})
 			continue
 		}
 		usersBatch = append(usersBatch, userStruct)
@@ -63,21 +74,21 @@ func SelectMessages(in, out chan interface{}) {
 			continue
 		}
 		wg.Add(1)
-		go getMessagesByBatch(wg, slices.Clone(usersBatch), out)
+		go getMessagesByBatch(slices.Clone(usersBatch), out, wg)
 		usersBatch = usersBatch[:0]
 	}
 	if len(usersBatch) != 0 {
 		wg.Add(1)
-		go getMessagesByBatch(wg, slices.Clone(usersBatch), out)
+		go getMessagesByBatch(slices.Clone(usersBatch), out, wg)
 	}
 	wg.Wait()
 }
 
-func getMessagesByBatch(group *sync.WaitGroup, batch []User, out chan<- interface{}) {
+func getMessagesByBatch(batch []User, out chan<- interface{}, group *sync.WaitGroup) {
 	defer group.Done()
 	messages, err := GetMessages(batch...)
 	if err != nil {
-		log.Println("GetMessages func returned error: " + err.Error())
+		log.Printf("GetMessages func returned error: %s\n", err.Error())
 		return
 	}
 	for _, message := range messages {
@@ -99,12 +110,12 @@ func checkSpamWorker(group *sync.WaitGroup, in, out chan interface{}) {
 	for msgID := range in {
 		message, ok := msgID.(MsgID)
 		if !ok {
-			log.Printf("CheckSpam: failed to convert to type: %T", MsgID(0))
+			log.Printf("CheckSpam: failed to convert to type: %T\n", MsgID(0))
 			return
 		}
 		hasSpam, err := HasSpam(message)
 		if err != nil {
-			log.Println("HasSpam func returned error: " + err.Error())
+			log.Printf("HasSpam func returned error: %s", err.Error())
 			return
 		}
 		out <- MsgData{message, hasSpam}
@@ -112,7 +123,7 @@ func checkSpamWorker(group *sync.WaitGroup, in, out chan interface{}) {
 }
 
 func CombineResults(in, out chan interface{}) {
-	messages := make([]MsgData, 0)
+	messages := make([]MsgData, 0, 42)
 	for msgData := range in {
 		messageStruct, ok := msgData.(MsgData)
 		if !ok {
